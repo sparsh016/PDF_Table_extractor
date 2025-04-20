@@ -4,63 +4,112 @@ import numpy as np
 from collections import defaultdict
 
 def extract_tables_from_pdf(pdf_path):
+    """
+    Extract tables from PDF using spatial layout analysis
+    Returns: List of tables (each table is list of rows)
+    """
     doc = fitz.open(pdf_path)
-    all_tables = []
-    
-    for page in doc:
-        text_blocks = page.get_text("blocks")
-        text_blocks = [b for b in text_blocks if b[6] == 0]  # Remove image blocks
-        text_blocks.sort(key=lambda b: (b[1], b[0]))
+    tables = []
+    current_table = []
 
-        # Dynamic row grouping
-        y_coords = [b[1] for b in text_blocks]
-        y_threshold = np.median(np.diff(sorted(y_coords))) / 2 if len(y_coords) > 1 else 3
+    for page in doc:
+        # Get text blocks with coordinates
+        blocks = page.get_text("blocks", sort=True)
+        blocks = [b for b in blocks if b[6] == 0]  # Remove image blocks
+
+        # Cluster blocks into rows using y-coordinates
+        y_coords = sorted(list({b[1] for b in blocks}))
+        y_threshold = np.median(np.diff(y_coords)) if len(y_coords) > 1 else 10
 
         rows = defaultdict(list)
-        current_y = None
-        for block in text_blocks:
-            if current_y is None or abs(block[1] - current_y) > y_threshold:
-                current_y = block[1]
-            rows[current_y].append(block)
+        for block in blocks:
+            y = min(y_coords, key=lambda y: abs(y - block[1]))
+            rows[y].append(block)
 
-        # Column detection
-        table = []
+        # Process each row
         for y in sorted(rows.keys()):
             row_blocks = sorted(rows[y], key=lambda b: b[0])
             
-            # Calculate dynamic column gaps
-            if len(row_blocks) > 1:
-                gaps = [row_blocks[i+1][0] - row_blocks[i][2] 
-                       for i in range(len(row_blocks)-1)]
-                median_gap = np.median(gaps) if gaps else 0
-                col_threshold = median_gap * 1.5 if median_gap > 0 else 5
-            else:
-                col_threshold = 5
+            # Calculate column gaps
+            gaps = [row_blocks[i+1][0] - row_blocks[i][2] 
+                    for i in range(len(row_blocks)-1)]
+            col_threshold = np.median(gaps) * 1.2 if gaps else 5
 
-            # Merge columns
+            # Merge cells into columns
             row = []
-            prev_right = -float('inf')
+            prev_right = -np.inf
+            current_cell = ""
             for b in row_blocks:
                 if b[0] - prev_right > col_threshold:
-                    row.append(b[4].strip())
+                    if current_cell:
+                        row.append(current_cell.strip())
+                    current_cell = b[4].strip()
                 else:
-                    row[-1] += " " + b[4].strip()
+                    current_cell += " " + b[4].strip()
                 prev_right = b[2]
+            if current_cell:
+                row.append(current_cell.strip())
 
-            # Filter non-table content
-            if (len(row) > 1 and 
-                not any(s in cell for cell in row 
-                       for s in ["***END", "Page No:", "BANK NAME"])):
-                table.append(row)
+            # Filter non-table rows
+            if is_table_row(row):
+                if current_table and len(row) != len(current_table[0]):
+                    # Column count changed - finalize current table
+                    tables.append(current_table)
+                    current_table = []
+                current_table.append(row)
+            elif current_table:
+                # End of table
+                tables.append(current_table)
+                current_table = []
 
-        # Merge with previous tables if column count matches
-        if table:
-            if all_tables and len(table[0]) == len(all_tables[-1][0]):
-                all_tables.extend(table)
-            else:
-                all_tables.append(table)
+        # Handle table continuing to next page
+        if current_table and tables and len(current_table[0]) == len(tables[-1][0]):
+            tables[-1].extend(current_table)
+            current_table = []
+
+    if current_table:
+        tables.append(current_table)
 
     doc.close()
-    return all_tables[0] if all_tables else []
+    return tables
 
-# Rest of the code remains similar
+def is_table_row(row):
+    """Determine if a row belongs to a table"""
+    if len(row) < 2:
+        return False
+    excluded_phrases = [
+        "BANK NAME", "Page No:", "***END", "REPORT PRINTED BY",
+        "Statement of account", "Grand Total:", "NOTE:"
+    ]
+    return not any(phrase in cell for cell in row for phrase in excluded_phrases)
+
+def save_tables_to_excel(tables, output_path):
+    """Save extracted tables to Excel with multiple sheets"""
+    with pd.ExcelWriter(output_path) as writer:
+        for i, table in enumerate(tables):
+            if len(table) < 2:
+                continue  # Skip single-row tables
+                
+            # Try to detect header row
+            header = table[0] if is_header(table[0], table[1]) else None
+            data = table[1:] if header else table
+            
+            df = pd.DataFrame(data, columns=header or None)
+            sheet_name = f"Table_{i+1}"
+            df.to_excel(writer, sheet_name=sheet_name, index=False)
+
+def is_header(header_row, first_data_row):
+    """Check if a row is likely a table header"""
+    if len(header_row) != len(first_data_row):
+        return False
+    # Check for typical header characteristics
+    return any(char.isupper() for cell in header_row for char in cell)
+
+if __name__ == "__main__":
+    input_pdfs = ["test3 (1) (1).pdf", "test6 (1) (1).pdf"]
+    
+    for pdf_path in input_pdfs:
+        tables = extract_tables_from_pdf(pdf_path)
+        output_file = pdf_path.replace(".pdf", "_output.xlsx")
+        save_tables_to_excel(tables, output_file)
+        print(f"Processed {pdf_path}. Created {output_file} with {len(tables)} tables.")
